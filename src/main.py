@@ -136,21 +136,38 @@ def ping():
 def list_courses():
     state = _load()
     synced = state.get("course_synced", {})
-    return [
-        {**c, "last_synced": synced.get(c["id"])}
-        for c in state.get("courses", [])
-    ]
+    result = []
+    for c in state.get("courses", []):
+        course_dir = DOWNLOAD_DIR / sanitize(c["name"])
+        if not course_dir.exists():
+            continue
+        if "vorlesungsunterlagen" in c["name"].lower():
+            # Expose each section as its own course — the container itself is not a course
+            for section_dir in sorted(course_dir.iterdir()):
+                if section_dir.is_dir() and not section_dir.name.startswith("."):
+                    result.append({
+                        "id": str(section_dir.relative_to(DOWNLOAD_DIR)),
+                        "name": section_dir.name,
+                        "last_synced": synced.get(c["id"]),
+                    })
+        else:
+            result.append({
+                "id": str(course_dir.relative_to(DOWNLOAD_DIR)),
+                "name": c["name"],
+                "last_synced": synced.get(c["id"]),
+            })
+    return result
 
 
-@app.get("/courses/{course_id}/files")
-def list_files(course_id: str):
-    state = _load()
-    course = next((c for c in state.get("courses", []) if c["id"] == course_id), None)
-    if not course:
+@app.get("/courses/{path:path}/files")
+def list_files(path: str):
+    course_dir = DOWNLOAD_DIR / path
+    try:
+        course_dir.resolve().relative_to(DOWNLOAD_DIR.resolve())
+    except ValueError:
+        raise HTTPException(403, "Forbidden")
+    if not course_dir.is_dir():
         raise HTTPException(404, "Course not found")
-    course_dir = DOWNLOAD_DIR / sanitize(course["name"])
-    if not course_dir.exists():
-        return []
     return [
         {
             "name": f.name,
