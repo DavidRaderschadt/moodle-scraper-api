@@ -1,7 +1,7 @@
 [project]
 name = "moodle-api"
 version = "0.1.0"
-description = "Add your description here"
+description = "Moodle DHBW Mannheim scraper API — scheduled file sync served over HTTP"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -9,14 +10,26 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import FileResponse
+from fastapi.security import APIKeyHeader
 
-from scraper import DOWNLOAD_DIR, run_sync, sanitize
+from .scraper import DOWNLOAD_DIR, run_sync, sanitize
+
+log = logging.getLogger("moodle_api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/.state.json"))
 USERNAME = os.environ["MOODLE_USERNAME"]
 PASSWORD = os.environ["MOODLE_PASSWORD"]
+_API_KEY = os.environ["SYNC_API_KEY"]
+
+_key_header = APIKeyHeader(name="X-API-Key")
+
+
+def _require_key(key: str = Security(_key_header)) -> None:
+    if key != _API_KEY:
+        raise HTTPException(403, "Invalid API key")
 
 _executor = ThreadPoolExecutor(max_workers=1)
 _sync_lock = asyncio.Lock()
@@ -38,12 +51,18 @@ def _save(state: dict) -> None:
 
 async def _do_sync() -> None:
     if _sync_lock.locked():
+        log.info("sync already running, skipping")
         return
     async with _sync_lock:
-        loop = asyncio.get_event_loop()
-        state = _load()
-        await loop.run_in_executor(_executor, lambda: run_sync(USERNAME, PASSWORD, state))
-        _save(state)
+        log.info("sync started")
+        try:
+            loop = asyncio.get_event_loop()
+            state = _load()
+            summary = await loop.run_in_executor(_executor, lambda: run_sync(USERNAME, PASSWORD, state))
+            _save(state)
+            log.info("sync complete: %s", summary)
+        except Exception:
+            log.exception("sync failed")
 
 
 scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
@@ -110,9 +129,8 @@ def download_file(path: str):
     return FileResponse(fp, filename=fp.name)
 
 
-@app.post("/sync")
+@app.post("/sync", dependencies=[Depends(_require_key)])
 async def trigger_sync():
-    """Trigger an immediate sync outside the scheduled window."""
     if _sync_lock.locked():
         return {"status": "already_running"}
     asyncio.create_task(_do_sync())
