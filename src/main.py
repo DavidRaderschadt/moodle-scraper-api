@@ -146,7 +146,7 @@ def list_courses():
             for section_dir in sorted(course_dir.iterdir()):
                 if section_dir.is_dir() and not section_dir.name.startswith("."):
                     result.append({
-                        "id": str(section_dir.relative_to(DOWNLOAD_DIR)),
+                        "id": section_dir.name,
                         "name": section_dir.name,
                         "last_synced": synced.get(c["id"]),
                     })
@@ -161,13 +161,18 @@ def list_courses():
 
 @app.get("/courses/{path:path}/files")
 def list_files(path: str):
+    # Direct match (standalone courses)
     course_dir = DOWNLOAD_DIR / path
+    if not course_dir.is_dir():
+        # Section name only — search one level deep
+        matches = [d for d in DOWNLOAD_DIR.glob(f"*/{path}") if d.is_dir()]
+        if not matches:
+            raise HTTPException(404, "Course not found")
+        course_dir = matches[0]
     try:
         course_dir.resolve().relative_to(DOWNLOAD_DIR.resolve())
     except ValueError:
         raise HTTPException(403, "Forbidden")
-    if not course_dir.is_dir():
-        raise HTTPException(404, "Course not found")
     return [
         {
             "name": f.name,
