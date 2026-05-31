@@ -1,0 +1,15 @@
+[project]
+name = "moodle-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "apscheduler==3.10.4",
+    "beautifulsoup4==4.12.3",
+    "fastapi==0.115.0",
+    "lxml==5.3.0",
+    "pytz==2024.2",
+    "requests==2.32.3",
+    "uvicorn[standard]==0.30.6",
+]
