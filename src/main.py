@@ -26,10 +26,13 @@ _API_KEY = os.environ["SYNC_API_KEY"]
 
 _key_header = APIKeyHeader(name="X-API-Key")
 
+_progress: dict = {"running": False, "current_course": None, "courses_done": 0, "courses_total": 0}
+
 
 def _require_key(key: str = Security(_key_header)) -> None:
     if key != _API_KEY:
         raise HTTPException(403, "Invalid API key")
+
 
 _executor = ThreadPoolExecutor(max_workers=1)
 _sync_lock = asyncio.Lock()
@@ -49,20 +52,47 @@ def _save(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
 
 
+def _on_course_start(name: str, index: int, total: int) -> None:
+    _progress["current_course"] = name
+    _progress["courses_done"] = index
+    _progress["courses_total"] = total
+    log.info("syncing course %d/%d: %s", index + 1, total, name)
+
+
+def _on_course_done(state: dict, name: str, done: int, total: int) -> None:
+    _progress["courses_done"] = done
+    _save(state)
+    log.info("done %d/%d: %s", done, total, name)
+
+
 async def _do_sync() -> None:
     if _sync_lock.locked():
         log.info("sync already running, skipping")
         return
     async with _sync_lock:
+        _progress["running"] = True
+        _progress["courses_done"] = 0
+        _progress["courses_total"] = 0
+        _progress["current_course"] = None
         log.info("sync started")
         try:
             loop = asyncio.get_event_loop()
             state = _load()
-            summary = await loop.run_in_executor(_executor, lambda: run_sync(USERNAME, PASSWORD, state))
+            summary = await loop.run_in_executor(
+                _executor,
+                lambda: run_sync(
+                    USERNAME, PASSWORD, state,
+                    on_course_start=_on_course_start,
+                    on_course_done=_on_course_done,
+                ),
+            )
             _save(state)
             log.info("sync complete: %s", summary)
         except Exception:
             log.exception("sync failed")
+        finally:
+            _progress["running"] = False
+            _progress["current_course"] = None
 
 
 scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
@@ -87,7 +117,15 @@ app = FastAPI(title="Moodle DHBW API", lifespan=lifespan)
 @app.get("/ping")
 def ping():
     state = _load()
-    return {"status": "ok", "last_refresh": state.get("last_refresh")}
+    resp: dict = {"status": "ok", "last_refresh": state.get("last_refresh"), "sync": {"running": False}}
+    if _progress["running"]:
+        resp["sync"] = {
+            "running": True,
+            "current_course": _progress["current_course"],
+            "courses_done": _progress["courses_done"],
+            "courses_total": _progress["courses_total"],
+        }
+    return resp
 
 
 @app.get("/courses")
@@ -121,7 +159,6 @@ def download_file(path: str):
     fp = DOWNLOAD_DIR / path
     if not fp.is_file():
         raise HTTPException(404, "File not found")
-    # Prevent path traversal
     try:
         fp.resolve().relative_to(DOWNLOAD_DIR.resolve())
     except ValueError:

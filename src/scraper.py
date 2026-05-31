@@ -191,8 +191,12 @@ class MoodleScraper:
             return False
 
 
-def run_sync(username: str, password: str, state: dict) -> dict:
-    """Run a full sync. Mutates state in-place. Returns per-course summary."""
+def run_sync(username: str, password: str, state: dict, *, on_course_start=None, on_course_done=None) -> dict:
+    """Run a full sync. Mutates state in-place. Returns per-course summary.
+
+    on_course_start(name, index, total) -- called before each course starts
+    on_course_done(state, name, index, total) -- called after each course finishes
+    """
     scraper = MoodleScraper(username, password)
     if not scraper.login():
         return {"error": "login_failed"}
@@ -200,13 +204,17 @@ def run_sync(username: str, password: str, state: dict) -> dict:
     state["courses"] = courses
     state.setdefault("files", {})
     summary = {}
-    for course in courses:
+    for i, course in enumerate(courses):
+        if on_course_start:
+            on_course_start(course["name"], i, len(courses))
         dl, skip = scraper.sync_course(course, state["files"])
         summary[course["id"]] = {
             "name": course["name"],
             "downloaded": dl,
             "skipped": skip,
         }
+        if on_course_done:
+            on_course_done(state, course["name"], i + 1, len(courses))
     state["last_refresh"] = datetime.now().isoformat()
     return summary
 
