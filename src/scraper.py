@@ -183,7 +183,7 @@ class MoodleScraper:
         target.mkdir(parents=True, exist_ok=True)
         fp = target / name
         key = str(fp.relative_to(DOWNLOAD_DIR))
-        if fp.exists() and file_hashes.get(key) == _md5(fp):
+        if fp.exists() and key in file_hashes:
             return False
         try:
             resp = self._s.get(url, stream=True, timeout=60)
