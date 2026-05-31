@@ -18,12 +18,18 @@ DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/data/files"))
 _filter_str = os.environ.get("COURSE_FILTER_PATTERN", r"[A-Z]{2,}[\-_]?[A-Z]*\d{2}[A-Z]")
 COURSE_PATTERN = re.compile(_filter_str)
 
-# Course names that are institutional, not lecture courses
+# Course names to exclude — nav sections and admin courses, not lecture courses
 _EXCLUDED = {
     "studieren an der dhbw",
     "welcome",
     "willkommen",
     "allgemein",
+    "ma-wdski24a-sgmgm",
+    "participants",
+    "competencies",
+    "grades",
+    "general",
+    "online-hörsaal",
 }
 
 
@@ -72,9 +78,6 @@ class MoodleScraper:
                 if not course_id or len(name) < 3:
                     continue
                 if any(term in name.lower() for term in _EXCLUDED):
-                    continue
-                # Pure uppercase names (e.g. MA-WDSKI24A-SGMGM) are admin/management courses
-                if name.isupper():
                     continue
                 if not COURSE_PATTERN.search(name):
                     continue
