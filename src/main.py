@@ -44,7 +44,7 @@ def _load() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"last_refresh": None, "files": {}, "courses": []}
+    return {"last_refresh": None, "file_sizes": {}, "courses": []}
 
 
 def _save(state: dict) -> None:

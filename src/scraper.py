@@ -1,6 +1,5 @@
 """Moodle DHBW scraper — login, discover courses, download files."""
 
-import hashlib
 import os
 import re
 import time
@@ -14,11 +13,9 @@ from bs4 import BeautifulSoup
 MOODLE_URL = "https://moodle.dhbw-mannheim.de"
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/data/files"))
 
-# Cohort codes: WDSKI24A, MA-WDSKI24A, TIT23B, etc.
 _filter_str = os.environ.get("COURSE_FILTER_PATTERN", r"[A-Z]{2,}[\-_]?[A-Z]*\d{2}[A-Z]")
 COURSE_PATTERN = re.compile(_filter_str)
 
-# Course names to exclude — nav sections and admin courses, not lecture courses
 _EXCLUDED = {
     "studieren an der dhbw",
     "welcome",
@@ -61,7 +58,6 @@ class MoodleScraper:
         return "logout" in resp.text.lower()
 
     def discover_courses(self) -> list[dict]:
-        """Return lecture courses the user is enrolled in, filtered by cohort pattern."""
         seen: dict[str, dict] = {}
         for url in (f"{self._base}/my/", f"{self._base}/my/courses.php"):
             try:
@@ -89,8 +85,7 @@ class MoodleScraper:
                     }
         return list(seen.values())
 
-    def sync_course(self, course: dict, file_hashes: dict) -> tuple[int, int]:
-        """Download all files for one course. Returns (downloaded, skipped)."""
+    def sync_course(self, course: dict, file_sizes: dict) -> tuple[int, int]:
         course_dir = DOWNLOAD_DIR / sanitize(course["name"])
         page = self._s.get(course["url"], timeout=15)
         soup = BeautifulSoup(page.text, "lxml")
@@ -109,11 +104,11 @@ class MoodleScraper:
                 href = link["href"]
                 full_url = urljoin(self._base, href)
                 if "/mod/folder/view.php" in href:
-                    d, s = self._sync_folder(full_url, name or "folder", section_dir, file_hashes)
+                    d, s = self._sync_folder(full_url, name or "folder", section_dir, file_sizes)
                     total_dl += d
                     total_skip += s
                 elif "/mod/resource/view.php" in href or "/pluginfile.php/" in href:
-                    if self._dl(full_url, name, section_dir, file_hashes):
+                    if self._dl(full_url, name, section_dir, file_sizes):
                         total_dl += 1
                     else:
                         total_skip += 1
@@ -125,7 +120,7 @@ class MoodleScraper:
         url: str,
         name: str,
         parent: Path,
-        file_hashes: dict,
+        file_sizes: dict,
         visited: set | None = None,
         depth: int = 0,
     ) -> tuple[int, int]:
@@ -148,12 +143,12 @@ class MoodleScraper:
                     continue
                 full = urljoin(self._base, href)
                 if "/pluginfile.php/" in href:
-                    if self._dl(full, text, folder_dir, file_hashes):
+                    if self._dl(full, text, folder_dir, file_sizes):
                         dl += 1
                     else:
                         skip += 1
                 elif "/mod/folder/view.php" in href and full not in visited:
-                    d, s = self._sync_folder(full, text, folder_dir, file_hashes, visited, depth + 1)
+                    d, s = self._sync_folder(full, text, folder_dir, file_sizes, visited, depth + 1)
                     dl += d
                     skip += s
                 time.sleep(0.2)
@@ -161,59 +156,70 @@ class MoodleScraper:
             pass
         return dl, skip
 
-    def _dl(self, url: str, name: str, target: Path, file_hashes: dict) -> bool:
-        """Download a single file. Returns True if newly downloaded."""
+    def _dl(self, url: str, name: str, target: Path, file_sizes: dict) -> bool:
+        """Download a file if new or changed. Returns True if downloaded."""
         name = sanitize(name)
         if len(name) < 3:
             name = urlparse(url).path.rstrip("/").split("/")[-1] or "file"
+
+        # HEAD request: get remote size + content-type (for extension detection)
+        remote_size = None
+        ct = ""
+        try:
+            head = self._s.head(url, allow_redirects=True, timeout=10)
+            remote_size = head.headers.get("content-length")
+            ct = head.headers.get("content-type", "")
+        except Exception:
+            pass
+
         if "." not in name:
-            try:
-                head = self._s.head(url, allow_redirects=True, timeout=10)
-                ct = head.headers.get("content-type", "")
-                if "pdf" in ct:
-                    name += ".pdf"
-                elif "zip" in ct:
-                    name += ".zip"
-                elif "wordprocessingml" in ct or "msword" in ct:
-                    name += ".docx"
-                elif "presentationml" in ct or "powerpoint" in ct:
-                    name += ".pptx"
-            except Exception:
-                pass
+            if "pdf" in ct:
+                name += ".pdf"
+            elif "zip" in ct:
+                name += ".zip"
+            elif "wordprocessingml" in ct or "msword" in ct:
+                name += ".docx"
+            elif "presentationml" in ct or "powerpoint" in ct:
+                name += ".pptx"
+
         target.mkdir(parents=True, exist_ok=True)
         fp = target / name
         key = str(fp.relative_to(DOWNLOAD_DIR))
-        if fp.exists() and key in file_hashes:
-            return False
+
+        if fp.exists():
+            if remote_size is None:
+                # Can't determine remote size — trust local copy
+                return False
+            if file_sizes.get(key) == remote_size:
+                # Size matches what we stored last time — unchanged
+                return False
+            # Size differs — prof updated the file, re-download
+
         try:
             resp = self._s.get(url, stream=True, timeout=60)
             resp.raise_for_status()
             with open(fp, "wb") as f:
                 for chunk in resp.iter_content(8192):
                     f.write(chunk)
-            file_hashes[key] = _md5(fp)
+            # Store the size we got so next sync can compare
+            file_sizes[key] = resp.headers.get("content-length") or remote_size
             return True
         except Exception:
             return False
 
 
 def run_sync(username: str, password: str, state: dict, *, on_course_start=None, on_course_done=None) -> dict:
-    """Run a full sync. Mutates state in-place. Returns per-course summary.
-
-    on_course_start(name, index, total) -- called before each course starts
-    on_course_done(state, name, index, total) -- called after each course finishes
-    """
     scraper = MoodleScraper(username, password)
     if not scraper.login():
         return {"error": "login_failed"}
     courses = scraper.discover_courses()
     state["courses"] = courses
-    state.setdefault("files", {})
+    state.setdefault("file_sizes", {})
     summary = {}
     for i, course in enumerate(courses):
         if on_course_start:
             on_course_start(course["name"], i, len(courses))
-        dl, skip = scraper.sync_course(course, state["files"])
+        dl, skip = scraper.sync_course(course, state["file_sizes"])
         summary[course["id"]] = {
             "name": course["name"],
             "downloaded": dl,
@@ -229,11 +235,3 @@ def sanitize(name: str) -> str:
     for ch in '<>:"/\\|?*':
         name = name.replace(ch, "_")
     return name.replace("&amp;", "&").strip()
-
-
-def _md5(path: Path) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            h.update(chunk)
-    return h.hexdigest()
