@@ -73,6 +73,9 @@ class MoodleScraper:
                     continue
                 if any(term in name.lower() for term in _EXCLUDED):
                     continue
+                # Pure uppercase names (e.g. MA-WDSKI24A-SGMGM) are admin/management courses
+                if name.isupper():
+                    continue
                 if not COURSE_PATTERN.search(name):
                     continue
                 if course_id not in seen:
