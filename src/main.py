@@ -6,6 +6,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -61,6 +62,9 @@ def _on_course_start(name: str, index: int, total: int) -> None:
 
 def _on_course_done(state: dict, name: str, done: int, total: int) -> None:
     _progress["courses_done"] = done
+    course = next((c for c in state.get("courses", []) if c["name"] == name), None)
+    if course:
+        state.setdefault("course_synced", {})[course["id"]] = datetime.now().isoformat()
     _save(state)
     log.info("done %d/%d: %s", done, total, name)
 
@@ -130,7 +134,12 @@ def ping():
 
 @app.get("/courses")
 def list_courses():
-    return _load().get("courses", [])
+    state = _load()
+    synced = state.get("course_synced", {})
+    return [
+        {**c, "last_synced": synced.get(c["id"])}
+        for c in state.get("courses", [])
+    ]
 
 
 @app.get("/courses/{course_id}/files")
@@ -147,6 +156,7 @@ def list_files(course_id: str):
             "name": f.name,
             "path": str(f.relative_to(DOWNLOAD_DIR)),
             "size": f.stat().st_size,
+            "last_downloaded": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
             "download_url": f"/files/{f.relative_to(DOWNLOAD_DIR)}",
         }
         for f in sorted(course_dir.rglob("*"))
