@@ -1,37 +1,26 @@
 """Moodle DHBW scraper — login, discover courses, download files."""
 
+import logging
 import os
-import re
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, parse_qs, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+from .helpers import sanitize, _normalize, EXCLUDED, resolve_filename
+
 MOODLE_URL = "https://moodle.dhbw-mannheim.de"
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/data/files"))
 
-_filter_str = os.environ.get("COURSE_FILTER_PATTERN", r"[A-Z]{2,}[\-_]?[A-Z]*\d{2}[A-Z]")
-COURSE_PATTERN = re.compile(_filter_str)
-
-_EXCLUDED = {
-    "studieren an der dhbw",
-    "welcome",
-    "willkommen",
-    "allgemein",
-    "ma-wdski24a-sgmgm",
-    "participants",
-    "competencies",
-    "grades",
-    "general",
-    "online-hörsaal",
-}
+log = logging.getLogger("moodle_api")
 
 
 class MoodleScraper:
-    def __init__(self, username: str, password: str) -> None:
+    def __init__(self, username: str, password: str, file_sizes: dict) -> None:
+        """Set up the HTTP session and seed file_sizes from disk if the state is empty."""
         self._base = MOODLE_URL.rstrip("/")
         self._s = requests.Session()
         self._s.headers["User-Agent"] = (
@@ -40,8 +29,16 @@ class MoodleScraper:
         )
         self._username = username
         self._password = password
+        self._page_cache: dict[str, BeautifulSoup] = {}
+        self._file_sizes = file_sizes
+        if not file_sizes and DOWNLOAD_DIR.exists():
+            for f in DOWNLOAD_DIR.rglob("*"):
+                if f.is_file() and not f.name.startswith("."):
+                    key = str(f.relative_to(DOWNLOAD_DIR))
+                    file_sizes[key] = str(f.stat().st_size)
 
     def login(self) -> bool:
+        """Authenticate against Moodle. Returns True on success."""
         page = self._s.get(f"{self._base}/login/index.php", timeout=15)
         soup = BeautifulSoup(page.text, "lxml")
         token = soup.find("input", {"name": "logintoken"})
@@ -58,45 +55,71 @@ class MoodleScraper:
         return "logout" in resp.text.lower()
 
     def discover_courses(self) -> list[dict]:
+        """Return all courses, expanding Vorlesungsunterlagen into one entry per section."""
+        raw = self._scrape_course_links()
+        result = []
+        for course in raw.values():
+            if "vorlesungsunterlagen" in course["name"].lower():
+                result.extend(self._expand_vorlesungsunterlagen(course))
+            else:
+                result.append(course)
+        log.info("discovered %d courses: %s", len(result), [c["name"] for c in result])
+        return result
+
+    def _scrape_course_links(self) -> dict[str, dict]:
+        """Scrape /my/courses.php and return a mapping of course_id to course dict."""
         seen: dict[str, dict] = {}
-        for url in (f"{self._base}/my/", f"{self._base}/my/courses.php"):
-            try:
-                page = self._s.get(url, timeout=15)
-            except requests.RequestException:
-                continue
-            soup = BeautifulSoup(page.text, "lxml")
-            for a in soup.find_all("a", href=True):
-                href: str = a["href"]
-                if "/course/view.php?id=" not in href:
-                    continue
-                course_id = parse_qs(urlparse(href).query).get("id", [None])[0]
-                name = a.get_text(strip=True)
-                if not course_id or len(name) < 3:
-                    continue
-                if any(term in name.lower() for term in _EXCLUDED):
-                    continue
-                if not COURSE_PATTERN.search(name):
-                    continue
-                if course_id not in seen:
-                    seen[course_id] = {
-                        "id": course_id,
-                        "name": name,
-                        "url": urljoin(self._base, href),
-                    }
-        return list(seen.values())
-
-    def sync_course(self, course: dict, file_sizes: dict) -> tuple[int, int]:
-        course_dir = DOWNLOAD_DIR / sanitize(course["name"])
-        page = self._s.get(course["url"], timeout=15)
+        try:
+            page = self._s.get(f"{self._base}/my/courses.php", timeout=15)
+        except requests.RequestException:
+            return {}
         soup = BeautifulSoup(page.text, "lxml")
-
-        total_dl = total_skip = 0
-        for section in soup.find_all("li", {"data-sectionname": True}):
-            section_name = sanitize(section.get("data-sectionname", "").strip())
-            if not section_name:
+        for a in soup.find_all("a", href=True):
+            href: str = a["href"]
+            if "/course/view.php?id=" not in href:
                 continue
-            section_dir = course_dir / section_name
-            for activity in section.find_all("div", class_="activity-item"):
+            course_id = parse_qs(urlparse(href).query).get("id", [None])[0]
+            name = a.get_text(strip=True)
+            if not course_id or len(name) < 3:
+                continue
+            if any(term in _normalize(name) for term in EXCLUDED):
+                continue
+            if course_id not in seen:
+                seen[course_id] = {
+                    "id": course_id,
+                    "name": name,
+                    "url": urljoin(self._base, href),
+                }
+        return seen
+
+    def _expand_vorlesungsunterlagen(self, course: dict) -> list[dict]:
+        """Fetch a Vorlesungsunterlagen course page and return one entry per section."""
+        result = []
+        try:
+            page = self._s.get(course["url"], timeout=15)
+            soup = BeautifulSoup(page.text, "lxml")
+            for section in soup.find_all("li", {"data-sectionname": True}):
+                section_name = section.get("data-sectionname", "").strip()
+                if not section_name or any(term in _normalize(section_name) for term in EXCLUDED):
+                    continue
+                result.append({"id": section_name, "name": section_name, "url": course["url"]})
+        except Exception:
+            log.warning("failed to expand %s", course["name"])
+        return result
+
+    def collect_files(self, course: dict) -> list[dict]:
+        """Return all downloadable files for a course as a list of {name, url} dicts."""
+        if course["url"] not in self._page_cache:
+            page = self._s.get(course["url"], timeout=15)
+            self._page_cache[course["url"]] = BeautifulSoup(page.text, "lxml")
+        soup = self._page_cache[course["url"]]
+
+        section = soup.find("li", {"data-sectionname": course["name"]})
+        sections = [section] if section else soup.find_all("li", {"data-sectionname": True})
+
+        files = []
+        for sec in sections:
+            for activity in sec.find_all("div", class_="activity-item"):
                 name = activity.get("data-activityname", "")
                 link = activity.find("a", href=True)
                 if not link:
@@ -104,96 +127,84 @@ class MoodleScraper:
                 href = link["href"]
                 full_url = urljoin(self._base, href)
                 if "/mod/folder/view.php" in href:
-                    d, s = self._sync_folder(full_url, name or "folder", section_dir, file_sizes)
-                    total_dl += d
-                    total_skip += s
+                    files.extend(self._collect_folder(full_url, name or "folder"))
                 elif "/mod/resource/view.php" in href or "/pluginfile.php/" in href:
-                    if self._dl(full_url, name, section_dir, file_sizes):
-                        total_dl += 1
-                    else:
-                        total_skip += 1
-                time.sleep(0.3)
-        return total_dl, total_skip
+                    files.append({"name": name, "url": full_url})
+        return files
 
-    def _sync_folder(
+    def _collect_folder(
         self,
         url: str,
         name: str,
-        parent: Path,
-        file_sizes: dict,
+        prefix: str = "",
         visited: set | None = None,
         depth: int = 0,
-    ) -> tuple[int, int]:
+    ) -> list[dict]:
+        """Recursively collect files from a Moodle folder activity (max depth 5)."""
         if visited is None:
             visited = set()
         if depth >= 5 or url in visited:
-            return 0, 0
+            return []
         visited.add(url)
-        folder_dir = parent / sanitize(name)
-        dl = skip = 0
+        folder_prefix = f"{prefix}{sanitize(name)}/"
+        files = []
         try:
             page = self._s.get(url, timeout=15)
             soup = BeautifulSoup(page.text, "lxml")
-            for a in soup.find_all("a", href=True):
+            container = (
+                soup.find("div", class_="filemanager")
+                or soup.find("div", class_="fp-content")
+                or soup.find("div", attrs={"role": "main"})
+                or soup.find("div", id="region-main")
+                or soup
+            )
+            for a in container.find_all("a", href=True):
                 href = a["href"]
                 text = a.get_text(strip=True)
-                if not text or "◀︎" in text or "▶︎" in text:
-                    continue
-                if "?lang=" in href or "&lang=" in href:
+                if not text or "?lang=" in href or "&lang=" in href:
                     continue
                 full = urljoin(self._base, href)
                 if "/pluginfile.php/" in href:
-                    if self._dl(full, text, folder_dir, file_sizes):
-                        dl += 1
-                    else:
-                        skip += 1
+                    files.append({"name": f"{folder_prefix}{text}", "url": full})
                 elif "/mod/folder/view.php" in href and full not in visited:
-                    d, s = self._sync_folder(full, text, folder_dir, file_sizes, visited, depth + 1)
-                    dl += d
-                    skip += s
-                time.sleep(0.2)
+                    files.extend(self._collect_folder(full, text, folder_prefix, visited, depth + 1))
         except Exception:
-            pass
+            log.warning("failed to fetch folder %s", url, exc_info=True)
+        return files
+
+    def sync_course(self, course: dict) -> tuple[int, int]:
+        """Download all new or updated files for a course. Returns (downloaded, skipped)."""
+        course_dir = DOWNLOAD_DIR / sanitize(course["name"])
+        dl = skip = 0
+        for f in self.collect_files(course):
+            fp = Path(f["name"])
+            target = course_dir / fp.parent if fp.parent != Path(".") else course_dir
+            if self._download_file(f["url"], fp.name, target):
+                dl += 1
+            else:
+                skip += 1
+            time.sleep(0.1)
         return dl, skip
 
-    def _dl(self, url: str, name: str, target: Path, file_sizes: dict) -> bool:
-        """Download a file if new or changed. Returns True if downloaded."""
-        name = sanitize(name)
-        if len(name) < 3:
-            name = urlparse(url).path.rstrip("/").split("/")[-1] or "file"
-
-        # HEAD request: get remote size + content-type (for extension detection)
-        remote_size = None
-        ct = ""
+    def _fetch_head(self, url: str) -> tuple[str | None, str]:
+        """Return (content-length, content-type) via HEAD request, or (None, '') on failure."""
         try:
             head = self._s.head(url, allow_redirects=True, timeout=10)
-            remote_size = head.headers.get("content-length")
-            ct = head.headers.get("content-type", "")
+            return head.headers.get("content-length"), head.headers.get("content-type", "")
         except Exception:
-            pass
+            return None, ""
 
-        if "." not in name:
-            if "pdf" in ct:
-                name += ".pdf"
-            elif "zip" in ct:
-                name += ".zip"
-            elif "wordprocessingml" in ct or "msword" in ct:
-                name += ".docx"
-            elif "presentationml" in ct or "powerpoint" in ct:
-                name += ".pptx"
+    def _download_file(self, url: str, name: str, target: Path) -> bool:
+        """Download a file to target, skipping if the remote size is unchanged. Returns True if downloaded."""
+        remote_size, ct = self._fetch_head(url)
+        name = resolve_filename(name, url, ct)
 
         target.mkdir(parents=True, exist_ok=True)
         fp = target / name
         key = str(fp.relative_to(DOWNLOAD_DIR))
 
-        if fp.exists():
-            if remote_size is None:
-                # Can't determine remote size — trust local copy
-                return False
-            if file_sizes.get(key) == remote_size:
-                # Size matches what we stored last time — unchanged
-                return False
-            # Size differs — prof updated the file, re-download
+        if fp.exists() and (remote_size is None or self._file_sizes.get(key) == remote_size):
+            return False
 
         try:
             resp = self._s.get(url, stream=True, timeout=60)
@@ -201,37 +212,39 @@ class MoodleScraper:
             with open(fp, "wb") as f:
                 for chunk in resp.iter_content(8192):
                     f.write(chunk)
-            # Store the size we got so next sync can compare
-            file_sizes[key] = resp.headers.get("content-length") or remote_size
+            self._file_sizes[key] = resp.headers.get("content-length") or remote_size or str(fp.stat().st_size)
             return True
         except Exception:
             return False
 
 
-def run_sync(username: str, password: str, state: dict, *, on_course_start=None, on_course_done=None) -> dict:
-    scraper = MoodleScraper(username, password)
-    if not scraper.login():
-        return {"error": "login_failed"}
-    courses = scraper.discover_courses()
-    state["courses"] = courses
-    state.setdefault("file_sizes", {})
+def _sync_courses(
+    scraper: MoodleScraper,
+    courses: list[dict],
+    state: dict,
+    on_course_start,
+    on_course_done,
+) -> dict:
+    """Iterate courses, fire progress callbacks, and return a per-course download summary."""
     summary = {}
     for i, course in enumerate(courses):
         if on_course_start:
             on_course_start(course["name"], i, len(courses))
-        dl, skip = scraper.sync_course(course, state["file_sizes"])
-        summary[course["id"]] = {
-            "name": course["name"],
-            "downloaded": dl,
-            "skipped": skip,
-        }
+        dl, skip = scraper.sync_course(course)
+        summary[course["id"]] = {"name": course["name"], "downloaded": dl, "skipped": skip}
         if on_course_done:
             on_course_done(state, course["name"], i + 1, len(courses))
-    state["last_refresh"] = datetime.now().isoformat()
     return summary
 
 
-def sanitize(name: str) -> str:
-    for ch in '<>:"/\\|?*':
-        name = name.replace(ch, "_")
-    return name.replace("&amp;", "&").strip()
+def run_sync(username: str, password: str, state: dict, *, on_course_start=None, on_course_done=None) -> dict:
+    """Log in, discover courses, sync files, and update state. Returns a per-course download summary."""
+    state.setdefault("file_sizes", {})
+    scraper = MoodleScraper(username, password, state["file_sizes"])
+    if not scraper.login():
+        return {"error": "login_failed"}
+    courses = scraper.discover_courses()
+    state["courses"] = courses
+    summary = _sync_courses(scraper, courses, state, on_course_start, on_course_done)
+    state["last_refresh"] = datetime.now().isoformat()
+    return summary

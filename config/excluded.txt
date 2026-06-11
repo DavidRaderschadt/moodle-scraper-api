@@ -1,0 +1,15 @@
+# One term per line (case-insensitive substring match against course name).
+# Lines starting with # are comments.
+
+studieren an der dhbw
+welcome
+willkommen
+allgemein
+ma-wdski24a-sgmgm
+participants
+competencies
+grades
+general
+online-hörsaal
+let's talk about ki
+sicherheitsunterweisung wirtschaft

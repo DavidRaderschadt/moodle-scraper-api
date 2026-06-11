@@ -15,7 +15,8 @@ from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 
-from .scraper import DOWNLOAD_DIR, run_sync, sanitize
+from .scraper import DOWNLOAD_DIR, run_sync
+from .helpers import sanitize
 
 log = logging.getLogger("moodle_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -31,6 +32,7 @@ _progress: dict = {"running": False, "current_course": None, "courses_done": 0, 
 
 
 def _require_key(key: str = Security(_key_header)) -> None:
+    """Reject requests that don't carry the correct API key."""
     if key != _API_KEY:
         raise HTTPException(403, "Invalid API key")
 
@@ -40,6 +42,7 @@ _sync_lock = asyncio.Lock()
 
 
 def _load() -> dict:
+    """Load persisted state from disk, returning a blank state if missing or corrupt."""
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
@@ -49,27 +52,21 @@ def _load() -> dict:
 
 
 def _save(state: dict) -> None:
+    """Persist state to disk as JSON."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
 
 
-def _on_course_start(name: str, index: int, total: int) -> None:
-    _progress["current_course"] = name
-    _progress["courses_done"] = index
-    _progress["courses_total"] = total
-    log.info("syncing course %d/%d: %s", index + 1, total, name)
-
-
-def _on_course_done(state: dict, name: str, done: int, total: int) -> None:
-    _progress["courses_done"] = done
-    course = next((c for c in state.get("courses", []) if c["name"] == name), None)
-    if course:
-        state.setdefault("course_synced", {})[course["id"]] = datetime.now().isoformat()
-    _save(state)
-    log.info("done %d/%d: %s", done, total, name)
+def _check_path(fp: Path) -> None:
+    """Raise 403 if fp escapes the download directory."""
+    try:
+        fp.resolve().relative_to(DOWNLOAD_DIR.resolve())
+    except ValueError:
+        raise HTTPException(403, "Forbidden")
 
 
 async def _do_sync() -> None:
+    """Run a full sync in the thread executor, updating _progress throughout."""
     if _sync_lock.locked():
         log.info("sync already running, skipping")
         return
@@ -80,14 +77,27 @@ async def _do_sync() -> None:
         _progress["current_course"] = None
         log.info("sync started")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             state = _load()
+
+            def on_course_start(name: str, index: int, total: int) -> None:
+                _progress["current_course"] = name
+                _progress["courses_total"] = total
+                log.info("syncing course %d/%d: %s", index + 1, total, name)
+
+            def on_course_done(st: dict, name: str, _done: int, _total: int) -> None:
+                _progress["courses_done"] += 1
+                course = next((c for c in st.get("courses", []) if c["name"] == name), None)
+                if course:
+                    st.setdefault("course_synced", {})[course["id"]] = datetime.now().isoformat()
+                log.info("done: %s", name)
+
             summary = await loop.run_in_executor(
                 _executor,
                 lambda: run_sync(
                     USERNAME, PASSWORD, state,
-                    on_course_start=_on_course_start,
-                    on_course_done=_on_course_done,
+                    on_course_start=on_course_start,
+                    on_course_done=on_course_done,
                 ),
             )
             _save(state)
@@ -120,6 +130,7 @@ app = FastAPI(title="Moodle DHBW API", lifespan=lifespan)
 
 @app.get("/ping")
 def ping():
+    """Return service status and current sync progress."""
     state = _load()
     resp: dict = {"status": "ok", "last_refresh": state.get("last_refresh"), "sync": {"running": False}}
     if _progress["running"]:
@@ -134,6 +145,7 @@ def ping():
 
 @app.get("/courses")
 def list_courses():
+    """List all courses that have a local download directory."""
     state = _load()
     synced = state.get("course_synced", {})
     result = []
@@ -141,65 +153,47 @@ def list_courses():
         course_dir = DOWNLOAD_DIR / sanitize(c["name"])
         if not course_dir.exists():
             continue
-        if "vorlesungsunterlagen" in c["name"].lower():
-            # Expose each section as its own course — the container itself is not a course
-            for section_dir in sorted(course_dir.iterdir()):
-                if section_dir.is_dir() and not section_dir.name.startswith("."):
-                    result.append({
-                        "id": section_dir.name,
-                        "name": section_dir.name,
-                        "last_synced": synced.get(c["id"]),
-                    })
-        else:
-            result.append({
-                "id": str(course_dir.relative_to(DOWNLOAD_DIR)),
-                "name": c["name"],
-                "last_synced": synced.get(c["id"]),
-            })
+        result.append({"id": c["id"], "name": c["name"], "last_synced": synced.get(c["id"])})
     return result
 
 
 @app.get("/courses/{path:path}/files")
 def list_files(path: str):
-    # Direct match (standalone courses)
+    """List all files under a course directory, resolved by name if the path is ambiguous."""
     course_dir = DOWNLOAD_DIR / path
+    _check_path(course_dir)
     if not course_dir.is_dir():
-        # Section name only — search one level deep
         matches = [d for d in DOWNLOAD_DIR.glob(f"*/{path}") if d.is_dir()]
         if not matches:
             raise HTTPException(404, "Course not found")
         course_dir = matches[0]
-    try:
-        course_dir.resolve().relative_to(DOWNLOAD_DIR.resolve())
-    except ValueError:
-        raise HTTPException(403, "Forbidden")
-    return [
-        {
-            "name": f.name,
-            "path": str(f.relative_to(DOWNLOAD_DIR)),
-            "size": f.stat().st_size,
-            "last_downloaded": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
-            "download_url": f"/files/{f.relative_to(DOWNLOAD_DIR)}",
-        }
-        for f in sorted(course_dir.rglob("*"))
-        if f.is_file() and not f.name.startswith(".")
-    ]
+    result = []
+    for f in sorted(course_dir.rglob("*")):
+        if f.is_file() and not f.name.startswith("."):
+            st = f.stat()
+            result.append({
+                "name": f.name,
+                "path": str(f.relative_to(DOWNLOAD_DIR)),
+                "size": st.st_size,
+                "last_downloaded": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                "download_url": f"/files/{f.relative_to(DOWNLOAD_DIR)}",
+            })
+    return result
 
 
 @app.get("/files/{path:path}")
 def download_file(path: str):
+    """Serve a file from the download directory."""
     fp = DOWNLOAD_DIR / path
     if not fp.is_file():
         raise HTTPException(404, "File not found")
-    try:
-        fp.resolve().relative_to(DOWNLOAD_DIR.resolve())
-    except ValueError:
-        raise HTTPException(403, "Forbidden")
+    _check_path(fp)
     return FileResponse(fp, filename=fp.name)
 
 
 @app.post("/sync", dependencies=[Depends(_require_key)])
 async def trigger_sync():
+    """Manually trigger a sync. Returns immediately if one is already running."""
     if _sync_lock.locked():
         return {"status": "already_running"}
     asyncio.create_task(_do_sync())
