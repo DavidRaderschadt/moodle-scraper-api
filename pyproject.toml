@@ -11,4 +11,5 @@ dependencies = [
     "lxml==5.3.0",
     "requests==2.32.3",
     "uvicorn[standard]==0.30.6",
+    "python-multipart>=0.0.9",
 ]

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, File, HTTPException, Security, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 
@@ -22,6 +22,7 @@ log = logging.getLogger("moodle_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/.state.json"))
+ANKI_DIR = Path(os.environ.get("ANKI_DIR", "/data/anki"))
 USERNAME = os.environ["MOODLE_USERNAME"]
 PASSWORD = os.environ["MOODLE_PASSWORD"]
 _API_KEY = os.environ["SYNC_API_KEY"]
@@ -63,6 +64,39 @@ def _check_path(fp: Path) -> None:
         fp.resolve().relative_to(DOWNLOAD_DIR.resolve())
     except ValueError:
         raise HTTPException(403, "Forbidden")
+
+
+def _check_anki_path(fp: Path) -> None:
+    """Raise 403 if fp escapes the anki directory."""
+    try:
+        fp.resolve().relative_to(ANKI_DIR.resolve())
+    except ValueError:
+        raise HTTPException(403, "Forbidden")
+
+
+def _resolve_course_dir(path: str) -> Path:
+    """Return the course directory, falling back to a glob search. Raises 404 if not found."""
+    course_dir = DOWNLOAD_DIR / path
+    _check_path(course_dir)
+    if not course_dir.is_dir():
+        matches = [d for d in DOWNLOAD_DIR.glob(f"*/{path}") if d.is_dir()]
+        if not matches:
+            raise HTTPException(404, "Course not found")
+        course_dir = matches[0]
+    return course_dir
+
+
+_APKG_MAGIC = b"PK\x03\x04"
+
+
+async def _validate_apkg(file: UploadFile) -> None:
+    """Raise 400 if the file is not a valid .apkg (ZIP-based) Anki deck."""
+    if not file.filename or not file.filename.lower().endswith(".apkg"):
+        raise HTTPException(400, "File must have .apkg extension")
+    header = await file.read(4)
+    await file.seek(0)
+    if header != _APKG_MAGIC:
+        raise HTTPException(400, "File is not a valid Anki deck (.apkg must be a ZIP archive)")
 
 
 async def _do_sync() -> None:
@@ -160,13 +194,7 @@ def list_courses():
 @app.get("/courses/{path:path}/files")
 def list_files(path: str):
     """List all files under a course directory, resolved by name if the path is ambiguous."""
-    course_dir = DOWNLOAD_DIR / path
-    _check_path(course_dir)
-    if not course_dir.is_dir():
-        matches = [d for d in DOWNLOAD_DIR.glob(f"*/{path}") if d.is_dir()]
-        if not matches:
-            raise HTTPException(404, "Course not found")
-        course_dir = matches[0]
+    course_dir = _resolve_course_dir(path)
     result = []
     for f in sorted(course_dir.rglob("*")):
         if f.is_file() and not f.name.startswith("."):
@@ -198,3 +226,56 @@ async def trigger_sync():
         return {"status": "already_running"}
     asyncio.create_task(_do_sync())
     return {"status": "started"}
+
+
+@app.post("/courses/{path:path}/anki", status_code=201)
+async def upload_anki_deck(path: str, file: UploadFile = File(...)):
+    """Upload an Anki deck (.apkg) for a course or lecture."""
+    _resolve_course_dir(path)
+    await _validate_apkg(file)
+
+    deck_dir = ANKI_DIR / path
+    deck_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = sanitize(file.filename)
+    fp = deck_dir / safe_name
+    _check_anki_path(fp)
+
+    fp.write_bytes(await file.read())
+    st = fp.stat()
+    return {
+        "name": safe_name,
+        "path": str(fp.relative_to(ANKI_DIR)),
+        "size": st.st_size,
+        "uploaded_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+        "download_url": f"/anki/{fp.relative_to(ANKI_DIR)}",
+    }
+
+
+@app.get("/courses/{path:path}/anki")
+def list_anki_decks(path: str):
+    """List all Anki decks uploaded for a course or lecture."""
+    _resolve_course_dir(path)
+    deck_dir = ANKI_DIR / path
+    if not deck_dir.is_dir():
+        return []
+    result = []
+    for f in sorted(deck_dir.glob("*.apkg")):
+        st = f.stat()
+        result.append({
+            "name": f.name,
+            "path": str(f.relative_to(ANKI_DIR)),
+            "size": st.st_size,
+            "uploaded_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+            "download_url": f"/anki/{f.relative_to(ANKI_DIR)}",
+        })
+    return result
+
+
+@app.get("/anki/{path:path}")
+def download_anki_deck(path: str):
+    """Download an Anki deck file."""
+    fp = ANKI_DIR / path
+    if not fp.is_file():
+        raise HTTPException(404, "Deck not found")
+    _check_anki_path(fp)
+    return FileResponse(fp, filename=fp.name, media_type="application/zip")
