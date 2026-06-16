@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -150,7 +151,7 @@ scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
 async def lifespan(app: FastAPI):
     scheduler.add_job(
         _do_sync,
-        CronTrigger(hour=3, minute=0, timezone="Europe/Berlin"),
+        CronTrigger(hour=3, minute=random.randint(0, 59), timezone="Europe/Berlin"),
         id="sync",
         replace_existing=True,
     )
