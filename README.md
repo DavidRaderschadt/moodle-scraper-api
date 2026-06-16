@@ -1,6 +1,6 @@
 # moodle-scraper-api
 
-Scrapes lecture files from DHBW Mannheim Moodle and serves them over a REST API. Runs as a Docker container, syncs automatically at 03:00 Berlin time, and makes files available for download immediately after each course finishes — no need to wait for the full sync to complete.
+Scrapes lecture files from DHBW Mannheim Moodle and serves them over a REST API. Runs as a Docker container, syncs automatically at a random time between 03:00 and 04:00 Berlin time, and makes files available for download immediately after each course finishes — no need to wait for the full sync to complete.
 
 ## Endpoints
 
@@ -11,6 +11,9 @@ Scrapes lecture files from DHBW Mannheim Moodle and serves them over a REST API.
 | `GET` | `/courses/{id}/files` | — | File listing for a course |
 | `GET` | `/files/{path}` | — | Download a file |
 | `POST` | `/sync` | `X-API-Key` | Trigger an immediate sync |
+| `POST` | `/courses/{path}/anki` | — | Upload an Anki deck (.apkg) for a course |
+| `GET` | `/courses/{path}/anki` | — | List Anki decks for a course |
+| `GET` | `/anki/{path}` | — | Download an Anki deck |
 
 ### `/ping` response
 
@@ -97,3 +100,7 @@ COURSE_FILTER_PATTERN=[A-Z]{2,}[\-_]?[A-Z]*\d{2}[A-Z]
 nix develop
 uvicorn src.main:app --reload
 ```
+
+## Deployment behind a reverse proxy
+
+If serving at a sub-path (e.g. `/uni/wdski24a/`), pass `--root-path /uni/wdski24a` to uvicorn in the Dockerfile CMD and configure the proxy to strip the prefix before forwarding. Interactive docs at `/docs` will work correctly with the root-path set.
