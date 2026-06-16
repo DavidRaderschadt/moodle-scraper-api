@@ -114,6 +114,9 @@ def _strip_scheduling(apkg_bytes: bytes) -> bytes:
                     " reps=0, lapses=0, left=0, odue=0, odid=0"
                 )
                 conn.execute("DELETE FROM revlog")
+                real_did = conn.execute("SELECT did FROM cards WHERE did != 1 LIMIT 1").fetchone()
+                if real_did:
+                    conn.execute("UPDATE cards SET did=? WHERE did=1", (real_did[0],))
                 conn.commit()
                 raw = conn.serialize()
                 conn.close()
