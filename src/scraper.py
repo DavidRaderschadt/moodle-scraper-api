@@ -40,7 +40,7 @@ class MoodleScraper:
     def login(self) -> bool:
         """Authenticate against Moodle. Returns True on success."""
         page = self._s.get(f"{self._base}/login/index.php", timeout=15)
-        soup = BeautifulSoup(page.text, "lxml")
+        soup = BeautifulSoup(page.text, "html.parser")
         token = soup.find("input", {"name": "logintoken"})
         data: dict = {
             "username": self._username,
@@ -73,7 +73,7 @@ class MoodleScraper:
             page = self._s.get(f"{self._base}/my/courses.php", timeout=15)
         except requests.RequestException:
             return {}
-        soup = BeautifulSoup(page.text, "lxml")
+        soup = BeautifulSoup(page.text, "html.parser")
         for a in soup.find_all("a", href=True):
             href: str = a["href"]
             if "/course/view.php?id=" not in href:
@@ -97,7 +97,7 @@ class MoodleScraper:
         result = []
         try:
             page = self._s.get(course["url"], timeout=15)
-            soup = BeautifulSoup(page.text, "lxml")
+            soup = BeautifulSoup(page.text, "html.parser")
             for section in soup.find_all("li", {"data-sectionname": True}):
                 section_name = section.get("data-sectionname", "").strip()
                 if not section_name or any(term in _normalize(section_name) for term in EXCLUDED):
@@ -111,7 +111,7 @@ class MoodleScraper:
         """Return all downloadable files for a course as a list of {name, url} dicts."""
         if course["url"] not in self._page_cache:
             page = self._s.get(course["url"], timeout=15)
-            self._page_cache[course["url"]] = BeautifulSoup(page.text, "lxml")
+            self._page_cache[course["url"]] = BeautifulSoup(page.text, "html.parser")
         soup = self._page_cache[course["url"]]
 
         section = soup.find("li", {"data-sectionname": course["name"]})
@@ -150,7 +150,7 @@ class MoodleScraper:
         files = []
         try:
             page = self._s.get(url, timeout=15)
-            soup = BeautifulSoup(page.text, "lxml")
+            soup = BeautifulSoup(page.text, "html.parser")
             container = (
                 soup.find("div", class_="filemanager")
                 or soup.find("div", class_="fp-content")

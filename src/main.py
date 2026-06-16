@@ -1,10 +1,13 @@
 """Moodle DHBW API — serves downloaded lecture files."""
 
 import asyncio
+import io
 import json
 import logging
 import os
 import random
+import sqlite3
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -89,6 +92,34 @@ def _resolve_course_dir(path: str) -> Path:
 
 _APKG_MAGIC = b"PK\x03\x04"
 
+_COLLECTION_NAMES = {"collection.anki2", "collection.anki21"}
+
+
+def _strip_scheduling(apkg_bytes: bytes) -> bytes:
+    """Return a copy of the .apkg with all scheduling data removed.
+
+    Resets every card to 'new' state and deletes the review log so that
+    importing the deck never overwrites another user's local progress.
+    """
+    in_buf = io.BytesIO(apkg_bytes)
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(in_buf, "r") as src, zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            raw = src.read(item.filename)
+            if item.filename in _COLLECTION_NAMES:
+                conn = sqlite3.connect(":memory:")
+                conn.deserialize(raw)
+                conn.execute(
+                    "UPDATE cards SET type=0, queue=0, due=ord, ivl=0, factor=0,"
+                    " reps=0, lapses=0, left=0, odue=0, odid=0"
+                )
+                conn.execute("DELETE FROM revlog")
+                conn.commit()
+                raw = conn.serialize()
+                conn.close()
+            dst.writestr(item, raw)
+    return out_buf.getvalue()
+
 
 async def _validate_apkg(file: UploadFile) -> None:
     """Raise 400 if the file is not a valid .apkg (ZIP-based) Anki deck."""
@@ -160,7 +191,7 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 
-app = FastAPI(title="Moodle DHBW API", lifespan=lifespan)
+app = FastAPI(title="Moodle DHBW API", lifespan=lifespan, root_path=os.environ.get("ROOT_PATH", ""))
 
 
 @app.get("/ping")
@@ -241,7 +272,7 @@ async def upload_anki_deck(path: str, file: UploadFile = File(...)):
     fp = deck_dir / safe_name
     _check_anki_path(fp)
 
-    fp.write_bytes(await file.read())
+    fp.write_bytes(_strip_scheduling(await file.read()))
     st = fp.stat()
     return {
         "name": safe_name,
