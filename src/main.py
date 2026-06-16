@@ -317,3 +317,32 @@ def download_anki_deck(path: str):
         raise HTTPException(404, "Deck not found")
     _check_anki_path(fp)
     return FileResponse(fp, filename=fp.name, media_type="application/zip")
+
+
+@app.patch("/anki/{path:path}")
+async def patch_anki_deck(path: str, file: UploadFile = File(...)):
+    """Replace an existing Anki deck with a new upload."""
+    fp = ANKI_DIR / path
+    if not fp.is_file():
+        raise HTTPException(404, "Deck not found")
+    _check_anki_path(fp)
+    await _validate_apkg(file)
+    fp.write_bytes(_strip_scheduling(await file.read()))
+    st = fp.stat()
+    return {
+        "name": fp.name,
+        "path": str(fp.relative_to(ANKI_DIR)),
+        "size": st.st_size,
+        "uploaded_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+        "download_url": f"/anki/{fp.relative_to(ANKI_DIR)}",
+    }
+
+
+@app.delete("/anki/{path:path}", dependencies=[Depends(_require_key)], status_code=204)
+def delete_anki_deck(path: str):
+    """Delete an Anki deck file."""
+    fp = ANKI_DIR / path
+    if not fp.is_file():
+        raise HTTPException(404, "Deck not found")
+    _check_anki_path(fp)
+    fp.unlink()

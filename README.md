@@ -14,6 +14,8 @@ Scrapes lecture files from DHBW Mannheim Moodle and serves them over a REST API.
 | `POST` | `/courses/{path}/anki` | — | Upload an Anki deck (.apkg) for a course |
 | `GET` | `/courses/{path}/anki` | — | List Anki decks for a course |
 | `GET` | `/anki/{path}` | — | Download an Anki deck |
+| `PATCH` | `/anki/{path}` | — | Replace an existing Anki deck |
+| `DELETE` | `/anki/{path}` | `X-API-Key` | Delete an Anki deck |
 
 ### `/ping` response
 
